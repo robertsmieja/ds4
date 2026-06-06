@@ -4431,6 +4431,22 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
+/* The legacy /v1/completions API has no structured field for reasoning, so
+ * thinking is rendered inline as raw <think>...</think> text in "text". The
+ * opening tag is injected into the rendered prompt to put the template into
+ * thinking mode (see parse_completion_request) and is therefore never part of
+ * the sampled completion -- only the model-generated </think> is. Re-attach
+ * the opening tag here so the non-streamed response carries a matching pair,
+ * mirroring the chunk written at the start of the streamed response. Returns
+ * NULL (no allocation) when the request does not need the prefix. */
+static char *completion_text_with_think_prefix(const request *r, const char *body) {
+    if (!r || r->kind != REQ_COMPLETION || !ds4_think_mode_enabled(r->think_mode)) return NULL;
+    buf b = {0};
+    buf_puts(&b, "<think>");
+    buf_puts(&b, body ? body : "");
+    return buf_take(&b);
+}
+
 static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls) {
@@ -10252,6 +10268,15 @@ static void generate_job(server *s, job *j) {
             ds4_tokens_free(&effective_prompt);
             return;
         }
+        /* Stream the same <think> prefix that completion_text_with_think_prefix()
+         * re-attaches for the non-streamed response (see its comment for why
+         * the opening tag must be synthesized rather than sampled). */
+        if (j->req.kind == REQ_COMPLETION && ds4_think_mode_enabled(j->req.think_mode) &&
+            !sse_chunk(j->fd, &j->req, id, "<think>", NULL)) {
+            server_log(DS4_LOG_GENERATION, "ds4-server: completion ctx=%s think-prefix chunk failed", ctx_span);
+            ds4_tokens_free(&effective_prompt);
+            return;
+        }
         if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
         if (responses_live_chat) {
             responses_stream_init(&j->req, &responses_live);
@@ -10846,11 +10871,14 @@ decode_again:
                                  &parsed_calls, final_finish,
                                  prompt_tokens, completion);
     } else {
+        const char *body = parsed_content ? parsed_content : (text.ptr ? text.ptr : "");
+        char *think_prefixed = completion_text_with_think_prefix(&j->req, body);
         final_response(j->fd, s->enable_cors, &j->req, id,
-                       parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+                       think_prefixed ? think_prefixed : body,
                        parsed_reasoning,
                        &parsed_calls, final_finish,
                        prompt_tokens, completion);
+        free(think_prefixed);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -12942,6 +12970,37 @@ static void test_render_non_thinking_prompt_closes_think(void) {
     TEST_ASSERT(strstr(prompt, "<｜User｜>Hello<｜Assistant｜></think>") != NULL);
     free(prompt);
     chat_msgs_free(&msgs);
+}
+
+static void test_completion_think_prefix_reattaches_opening_tag(void) {
+    /* /v1/completions has no structured reasoning field, so thinking is
+     * rendered inline as raw <think>...</think> text.  The opening tag is
+     * injected into the prompt (parse_completion_request) and is therefore
+     * never part of the sampled completion -- only the model-generated
+     * </think> is.  The helper must re-attach <think> so the response carries
+     * a matching pair. */
+    request r;
+    request_init(&r, REQ_COMPLETION, 128);
+    r.think_mode = DS4_THINK_HIGH;
+
+    char *prefixed = completion_text_with_think_prefix(&r, "reasoning...</think>answer");
+    TEST_ASSERT(prefixed != NULL);
+    TEST_ASSERT(!strcmp(prefixed, "<think>reasoning...</think>answer"));
+    free(prefixed);
+
+    /* Thinking disabled: the prompt already ends with </think>, no prefix
+     * is sampled-but-missing, so nothing should be re-attached. */
+    r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(completion_text_with_think_prefix(&r, "answer") == NULL);
+    request_free(&r);
+
+    /* Chat completions split reasoning into its own JSON field instead of
+     * inline tags, so the raw prefix must never be re-attached there. */
+    request chat_r;
+    request_init(&chat_r, REQ_CHAT, 128);
+    chat_r.think_mode = DS4_THINK_HIGH;
+    TEST_ASSERT(completion_text_with_think_prefix(&chat_r, "answer") == NULL);
+    request_free(&chat_r);
 }
 
 static void test_render_drops_old_reasoning_without_tools(void) {
@@ -15507,6 +15566,7 @@ static void ds4_server_unit_tests_run(void) {
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
+    test_completion_think_prefix_reattaches_opening_tag();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
