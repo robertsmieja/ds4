@@ -5843,6 +5843,56 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
     return true;
 }
 
+/* The chat template force-opens reasoning by appending a literal `<think>` (or
+ * `</think>` when thinking is off) to the rendered prompt -- see
+ * parse_completion_request / render_chat_prompt_text. That tag is therefore
+ * synthetic prompt furniture, not sampled output: generation usually starts
+ * mid-reasoning, and only skips a leading `<think>` here on the rare chance
+ * the model echoes it. Returns false while there isn't yet enough raw text to
+ * tell whether that prefix is present and the stream isn't final -- callers
+ * should treat that as "nothing to emit yet" and keep waiting.
+ *
+ * IMPORTANT: do not shortcut "no `<think>` prefix found" into switching modes
+ * to TEXT. That used to leak reasoning to clients as regular output text,
+ * because the model was already inside the think block when it produced its
+ * first token -- the mode change to TEXT must wait for `</think>` itself.
+ *
+ * On true, *emit_pos has been advanced past any detected prefix (first call
+ * only), *close_out holds the position of `</think>` (or NULL if not yet
+ * seen), and *limit_out holds a UTF-8-safe boundary up to which it is safe to
+ * emit raw[*emit_pos..*limit_out) as reasoning text. */
+static bool think_stream_scan(const char *raw, size_t raw_len, bool final,
+                              bool *checked_think_prefix, size_t *emit_pos,
+                              const char **close_out, size_t *limit_out) {
+    if (!*checked_think_prefix) {
+        const char *open = "<think>";
+        const size_t open_len = strlen(open);
+        if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
+            return false;
+        }
+        if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
+            *emit_pos = open_len;
+        }
+        *checked_think_prefix = true;
+    }
+
+    const char *close = strstr(raw + *emit_pos, "</think>");
+    size_t limit;
+    if (close) {
+        limit = (size_t)(close - raw);
+    } else if (final) {
+        limit = raw_len;
+    } else {
+        const size_t hold = strlen("</think>") - 1;
+        limit = raw_len > hold ? raw_len - hold : *emit_pos;
+        limit = utf8_stream_safe_len(raw, *emit_pos, limit, false);
+    }
+
+    *close_out = close;
+    *limit_out = limit;
+    return true;
+}
+
 static bool openai_sse_stream_update(int fd, server *s, const request *r, const char *id,
                                      openai_stream *st,
                                      const char *raw, size_t raw_len,
@@ -5850,28 +5900,11 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
     if (!st->active || !raw) return true;
 
     if (st->mode == OPENAI_STREAM_THINKING) {
-        if (!st->checked_think_prefix) {
-            const char *open = "<think>";
-            const size_t open_len = strlen(open);
-            if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
-                return true;
-            }
-            if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
-                st->emit_pos = open_len;
-            }
-            st->checked_think_prefix = true;
-        }
-
-        const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *close;
         size_t limit;
-        if (close) {
-            limit = (size_t)(close - raw);
-        } else if (final) {
-            limit = raw_len;
-        } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
+        if (!think_stream_scan(raw, raw_len, final, &st->checked_think_prefix,
+                               &st->emit_pos, &close, &limit)) {
+            return true;
         }
 
         if (limit > st->emit_pos) {
@@ -6538,37 +6571,11 @@ static bool responses_sse_stream_update(int fd, const request *r,
     const bool emit_reasoning = r->reasoning_summary_emit;
 
     if (st->mode == RESP_STREAM_THINKING) {
-        if (!st->checked_think_prefix) {
-            /* The chat template ends the prompt with the literal `<think>` (or
-             * `</think>` when thinking is off), so generation usually starts
-             * mid-reasoning rather than with the open tag. If the model does
-             * happen to repeat `<think>` we skip it; otherwise start from
-             * position 0. The earlier "no-think-prefix => switch to TEXT"
-             * shortcut here was incorrect: it leaked reasoning to clients as
-             * regular output_text because the model was already inside the
-             * think block when it produced its first token. The actual
-             * mode change to TEXT happens only when `</think>` is observed. */
-            const char *open = "<think>";
-            const size_t open_len = strlen(open);
-            if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
-                return true;
-            }
-            if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
-                st->emit_pos = open_len;
-            }
-            st->checked_think_prefix = true;
-        }
-
-        const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *close;
         size_t limit;
-        if (close) {
-            limit = (size_t)(close - raw);
-        } else if (final) {
-            limit = raw_len;
-        } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
+        if (!think_stream_scan(raw, raw_len, final, &st->checked_think_prefix,
+                               &st->emit_pos, &close, &limit)) {
+            return true;
         }
 
         if (limit > st->emit_pos) {
@@ -7424,28 +7431,11 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
     if (!st->active || !raw) return true;
 
     if (st->mode == ANTH_STREAM_THINKING) {
-        if (!st->checked_think_prefix) {
-            const char *open = "<think>";
-            const size_t open_len = strlen(open);
-            if (raw_len < open_len && !strncmp(raw, open, raw_len) && !final) {
-                return true;
-            }
-            if (raw_len >= open_len && !strncmp(raw, open, open_len)) {
-                st->emit_pos = open_len;
-            }
-            st->checked_think_prefix = true;
-        }
-
-        const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *close;
         size_t limit;
-        if (close) {
-            limit = (size_t)(close - raw);
-        } else if (final) {
-            limit = raw_len;
-        } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
+        if (!think_stream_scan(raw, raw_len, final, &st->checked_think_prefix,
+                               &st->emit_pos, &close, &limit)) {
+            return true;
         }
 
         if (limit > st->emit_pos) {
