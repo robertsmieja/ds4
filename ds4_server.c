@@ -12496,6 +12496,90 @@ static void test_responses_usage_reports_cache_details(void) {
     request_free(&r);
 }
 
+static void test_responses_chat_stream_emits_reasoning_summary_then_text(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.reasoning_summary_emit = true;
+
+    responses_stream st;
+    responses_stream_init(&r, &st);
+    /* Mirror the live job loop's setup (see responses_live.active = true
+     * right after responses_stream_init in generate_job): responses_sse_*
+     * helpers gate on st->active, which _init() deliberately leaves false
+     * so a freshly-allocated-but-not-yet-wired-up stream can't emit. */
+    st.active = true;
+    TEST_ASSERT(responses_sse_created(sv[0], &r, &st, 1234));
+
+    /* The chat template force-opens reasoning by appending a synthetic
+     * <think> to the rendered prompt (parse_completion_request /
+     * render_chat_prompt_text); the model does not normally re-sample it, so
+     * the raw text starts mid-reasoning and carries only the model-sampled
+     * </think> -- exactly how the live job loop feeds this function. */
+    const char *raw = "checking the arithmetic</think>The answer is 4.";
+    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, &st, raw, strlen(raw),
+                                          NULL, NULL, "stop", 10, 8, 1234));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *reasoning_added = strstr(out, "\"type\":\"response.output_item.added\"");
+    const char *reasoning_kind = strstr(out, "\"type\":\"reasoning\"");
+    const char *reasoning_id = strstr(out, "\"id\":\"rs_");
+    const char *summary_part = strstr(out, "\"type\":\"response.reasoning_summary_part.added\"");
+    const char *reasoning_delta = strstr(out, "\"type\":\"response.reasoning_summary_text.delta\"");
+    const char *reasoning_text = strstr(out, "\"checking the arithmetic\"");
+    const char *message_kind = strstr(out, "\"type\":\"message\"");
+    const char *message_id = strstr(out, "\"id\":\"msg_");
+    const char *text_delta = strstr(out, "\"type\":\"response.output_text.delta\"");
+    const char *answer_text = strstr(out, "\"The answer is 4.\"");
+    const char *completed = strstr(out, "\"type\":\"response.completed\"");
+
+    TEST_ASSERT(reasoning_added != NULL);
+    TEST_ASSERT(reasoning_kind != NULL);
+    TEST_ASSERT(reasoning_id != NULL);
+    TEST_ASSERT(summary_part != NULL);
+    TEST_ASSERT(reasoning_delta != NULL);
+    TEST_ASSERT(reasoning_text != NULL);
+    TEST_ASSERT(message_kind != NULL);
+    TEST_ASSERT(message_id != NULL);
+    TEST_ASSERT(text_delta != NULL);
+    TEST_ASSERT(answer_text != NULL);
+    TEST_ASSERT(completed != NULL);
+
+    /* Wire order must mirror the prompt-side mode transition that the
+     * synthetic <think>/</think> suffix forces: the reasoning summary item
+     * opens and streams first, then -- only once </think> is observed --
+     * the message item opens and streams the visible answer, and the
+     * response completes last. Critically, neither the synthetic <think>
+     * the server injected into the prompt nor the model-sampled </think>
+     * may leak onto the wire: Responses splits them into structured
+     * reasoning/message items instead of inlining raw tags the way
+     * /v1/completions necessarily does (see completion_text_with_think_prefix
+     * for that contrast). */
+    TEST_ASSERT(reasoning_added < reasoning_kind);
+    TEST_ASSERT(reasoning_kind < summary_part);
+    TEST_ASSERT(summary_part < reasoning_delta);
+    TEST_ASSERT(reasoning_delta < reasoning_text);
+    TEST_ASSERT(reasoning_text < message_kind);
+    TEST_ASSERT(message_kind < text_delta);
+    TEST_ASSERT(text_delta < answer_text);
+    TEST_ASSERT(answer_text < completed);
+    TEST_ASSERT(strstr(out, "<think>") == NULL);
+    TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
+    responses_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -15592,6 +15676,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_sends_incremental_text();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
+    test_responses_chat_stream_emits_reasoning_summary_then_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
